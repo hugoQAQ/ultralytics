@@ -248,10 +248,32 @@ def non_max_suppression(
         classes = torch.tensor(classes, device=prediction.device)
 
     if prediction.shape[-1] == 6 or end2end:  # end-to-end model (BNC, i.e. 1,300,6)
-        output = [pred[pred[:, 4] > conf_thres][:max_det] for pred in prediction]
+        output = [torch.zeros((0, prediction.shape[2]), device=prediction.device)] * prediction.shape[0]
+        keepi = [torch.zeros(0, device=prediction.device, dtype=torch.long)] * prediction.shape[0]
+        for i, pred_per_image in enumerate(prediction):
+            # Filter by confidence
+            conf_mask = pred_per_image[:, 4] > conf_thres
+            pred_conf_filtered = pred_per_image[conf_mask]
+            kept_idxs_conf_filtered = torch.where(conf_mask)[0]
+
+            # Apply max_det
+            pred_max_det_filtered = pred_conf_filtered[:max_det]
+            kept_idxs_max_det_filtered = kept_idxs_conf_filtered[:max_det]
+
+            output[i] = pred_max_det_filtered
+            keepi[i] = kept_idxs_max_det_filtered
+
         if classes is not None:
-            output = [pred[(pred[:, 5:6] == classes).any(1)] for pred in output]
-        return output
+            new_output = []
+            new_keepi = []
+            for i, pred_per_image in enumerate(output):
+                class_mask = (pred_per_image[:, 5:6] == classes).any(1)
+                new_output.append(pred_per_image[class_mask])
+                new_keepi.append(keepi[i][class_mask])
+            output = new_output
+            keepi = new_keepi
+
+        return (output, keepi) if return_idxs else output
 
     bs = prediction.shape[0]  # batch size (BCN, i.e. 1,84,6300)
     nc = nc or (prediction.shape[1] - 4)  # number of classes

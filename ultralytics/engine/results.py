@@ -284,11 +284,12 @@ class Results(SimpleClass, DataExportMixin):
         self.probs = Probs(probs) if probs is not None else None
         self.keypoints = Keypoints(keypoints, self.orig_shape) if keypoints is not None else None
         self.obb = OBB(obb, self.orig_shape) if obb is not None else None
+        self.logits = logits # Store logits here
         self.speed = speed if speed is not None else {"preprocess": None, "inference": None, "postprocess": None}
         self.names = names
         self.path = path
         self.save_dir = None
-        self._keys = "boxes", "masks", "probs", "keypoints", "obb"
+        self._keys = "boxes", "masks", "probs", "keypoints", "obb", "logits"
 
     def __getitem__(self, idx):
         """
@@ -332,6 +333,7 @@ class Results(SimpleClass, DataExportMixin):
         probs: Optional[torch.Tensor] = None,
         obb: Optional[torch.Tensor] = None,
         keypoints: Optional[torch.Tensor] = None,
+            logits: Optional[torch.Tensor] = None,
     ):
         """
         Update the Results object with new detection data.
@@ -362,10 +364,14 @@ class Results(SimpleClass, DataExportMixin):
             self.obb = OBB(obb, self.orig_shape)
         if keypoints is not None:
             self.keypoints = Keypoints(keypoints, self.orig_shape)
+        if logits is not None:
+            self.logits = logits
 
     def _apply(self, fn: str, *args, **kwargs):
         """
-        Apply a function to all non-empty attributes and return a new Results object with modified attributes.
+        Apply a function to all non-empty attributes that are instances of BaseTensor
+        and return a new Results object with modified attributes.
+        The `logits` attribute is handled separately as it's a raw tensor.
 
         This method is internally called by methods like .to(), .cuda(), .cpu(), etc.
 
@@ -387,7 +393,36 @@ class Results(SimpleClass, DataExportMixin):
         for k in self._keys:
             v = getattr(self, k)
             if v is not None:
-                setattr(r, k, getattr(v, fn)(*args, **kwargs))
+                if hasattr(v, fn): # Applies to BaseTensor subclasses (boxes, masks, etc.)
+                    setattr(r, k, getattr(v, fn)(*args, **kwargs))
+                elif k == "logits" and isinstance(v, torch.Tensor): # Explicitly handle logits if fn is a tensor op
+                    if fn == "cpu":
+                        r.logits = v.cpu()
+                    elif fn == "numpy":
+                        r.logits = v.numpy()
+                    elif fn == "cuda":
+                        r.logits = v.cuda(*args, **kwargs)
+                    elif fn == "to":
+                         r.logits = v.to(*args, **kwargs)
+                    # If fn is not a direct tensor method, logits might be copied as is or handled by specific methods
+                else: # For other attributes like names, path, speed, or if logits is None
+                    setattr(r, k, v) # Copy as is
+
+        # Ensure logits are handled if not covered by the loop (e.g. direct call to r.cpu())
+        if not hasattr(r, 'logits') or r.logits is None: # if logits wasn't set by _apply
+            if self.logits is not None:
+                if fn == "cpu":
+                    r.logits = self.logits.cpu()
+                elif fn == "numpy":
+                    r.logits = self.logits.numpy() if isinstance(self.logits, torch.Tensor) else self.logits
+                elif fn == "cuda":
+                    r.logits = self.logits.cuda(*args, **kwargs)
+                elif fn == "to":
+                    r.logits = self.logits.to(*args, **kwargs)
+                else:
+                    r.logits = self.logits # Default copy if fn is not a tensor op
+            else:
+                r.logits = None
         return r
 
     def cpu(self):
@@ -405,7 +440,17 @@ class Results(SimpleClass, DataExportMixin):
             >>> cpu_result = results[0].cpu()  # Move the first result to CPU
             >>> print(cpu_result.boxes.device)  # Output: cpu
         """
-        return self._apply("cpu")
+        r = self.new()
+        for k in self._keys:
+            v = getattr(self, k)
+            if v is not None:
+                if hasattr(v, "cpu"): # BaseTensor subclasses
+                    setattr(r, k, v.cpu())
+                elif k == "logits" and isinstance(v, torch.Tensor):
+                    r.logits = v.cpu()
+                else:
+                    setattr(r, k, v) # copy other attributes
+        return r
 
     def numpy(self):
         """
@@ -424,7 +469,19 @@ class Results(SimpleClass, DataExportMixin):
             This method creates a new Results object, leaving the original unchanged. It's useful for
             interoperability with numpy-based libraries or when CPU-based operations are required.
         """
-        return self._apply("numpy")
+        r = self.new()
+        for k in self._keys:
+            v = getattr(self, k)
+            if v is not None:
+                if hasattr(v, "numpy"): # BaseTensor subclasses
+                    setattr(r, k, v.numpy())
+                elif k == "logits" and isinstance(v, torch.Tensor):
+                    r.logits = v.numpy()
+                elif k == "logits" and isinstance(v, np.ndarray): # If logits already numpy
+                    r.logits = v
+                else:
+                    setattr(r, k, v) # copy other attributes
+        return r
 
     def cuda(self):
         """
@@ -439,7 +496,17 @@ class Results(SimpleClass, DataExportMixin):
             >>> for result in results:
             ...     result_cuda = result.cuda()  # Move each result to GPU
         """
-        return self._apply("cuda")
+        r = self.new()
+        for k in self._keys:
+            v = getattr(self, k)
+            if v is not None:
+                if hasattr(v, "cuda"): # BaseTensor subclasses
+                    setattr(r, k, v.cuda())
+                elif k == "logits" and isinstance(v, torch.Tensor):
+                    r.logits = v.cuda()
+                else:
+                    setattr(r, k, v) # copy other attributes
+        return r
 
     def to(self, *args, **kwargs):
         """
@@ -458,11 +525,23 @@ class Results(SimpleClass, DataExportMixin):
             >>> result_cpu = results[0].to("cpu")  # Move first result to CPU
             >>> result_half = results[0].to(dtype=torch.float16)  # Convert first result to half precision
         """
-        return self._apply("to", *args, **kwargs)
+        r = self.new()
+        for k in self._keys:
+            v = getattr(self, k)
+            if v is not None:
+                if hasattr(v, "to"): # BaseTensor subclasses and torch.Tensor
+                    setattr(r, k, v.to(*args, **kwargs))
+                # No specific 'else' for logits here, as self.logits.to() is standard if it's a tensor
+                # and hasattr(v, "to") will cover it.
+                # If logits is None or not a tensor, it will be copied by new() and not enter here.
+                else:
+                     setattr(r, k, v) # copy other attributes
+        return r
 
     def new(self):
         """
         Create a new Results object with the same image, path, names, and speed attributes.
+        Logits will be None in the new object by default.
 
         Returns:
             (Results): A new Results object with copied attributes from the original instance.
@@ -471,7 +550,7 @@ class Results(SimpleClass, DataExportMixin):
             >>> results = model("path/to/image.jpg")
             >>> new_result = results[0].new()
         """
-        return Results(orig_img=self.orig_img, path=self.path, names=self.names, speed=self.speed)
+        return Results(orig_img=self.orig_img, path=self.path, names=self.names, speed=self.speed, logits=None)
 
     def plot(
         self,
